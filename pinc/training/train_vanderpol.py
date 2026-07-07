@@ -11,8 +11,14 @@ Systems" (arXiv:2104.02556):
      as predictive model (Fig. 10, Table 1).
 
 Run with:  python -m pinc.training.train_vanderpol
+Resume a previously interrupted run with:
+           python -m pinc.training.train_vanderpol --resume
+Train on GPU (if available):
+           python -m pinc.training.train_vanderpol --device cuda
 """
+import argparse
 import time
+from concurrent.futures import ProcessPoolExecutor
 
 import torch
 import matplotlib.pyplot as plt
@@ -26,6 +32,7 @@ from pinc.datasets.vanderpol import make_vanderpol_sampler, random_control_signa
 from pinc.evaluation.rollout import pinc_rollout, mse_gen
 from pinc.simulation.rk4 import simulate, rk4_control_interface
 from pinc.control.nmpc import run_nmpc_simulation
+from pinc.utils.checkpoint import load_pinc_model
 
 
 def build_validation_trajectory(physics, T, n_steps=180, seed=0):
@@ -37,7 +44,30 @@ def build_validation_trajectory(physics, T, n_steps=180, seed=0):
 
 
 def train_pinc(physics, T, k1_epochs=500, k2_iters=2000, hidden=20, depth=4,
-               n_boundary=1000, n_collocation=100000, lambda_phys=1.0):
+               n_boundary=1000, n_collocation=100000, lambda_phys=1.0,
+               device="cpu", checkpoint_path=None, resume=False, save_every=100):
+    """
+    device          : "cpu", "cuda", or "cuda:N". Training (the ADAM/
+                      L-BFGS loop over boundary + collocation batches)
+                      is the part that actually benefits from a GPU;
+                      NMPC/rollout afterwards are left on CPU (see
+                      `run_control_experiment`) since they're dominated
+                      by small per-step SciPy/autograd overhead rather
+                      than raw matmul throughput.
+    checkpoint_path : if given, periodically saves training progress
+                      here so a killed/interrupted run can be resumed.
+    resume          : if True and a checkpoint already exists at
+                      `checkpoint_path`, restores model/optimizer state
+                      and continues training instead of starting over.
+    """
+
+    meta = {
+        "state_dim": physics.state_dim,
+        "control_dim": physics.control_dim,
+        "T": T,
+        "hidden": hidden,
+        "depth": depth,
+    }
 
     model = PINCModel(
         backbone=MLP(in_dim=1 + physics.state_dim + physics.control_dim,
@@ -56,12 +86,15 @@ def train_pinc(physics, T, k1_epochs=500, k2_iters=2000, hidden=20, depth=4,
         return mse_gen(m, y0_val, u_val, y_true_val)
 
     trainer = Trainer(model, sampler, loss_fn,
-                       n_boundary=n_boundary, n_collocation=n_collocation, lr=1e-3)
+                       n_boundary=n_boundary, n_collocation=n_collocation,
+                       lr=1e-3, device=device)
 
     history = trainer.fit(k1_epochs=k1_epochs, k2_iters=k2_iters,
-                           validate_fn=validate_fn, log_every=max(1, k1_epochs // 10))
+                           validate_fn=validate_fn, log_every=max(1, k1_epochs // 10),
+                           checkpoint_path=checkpoint_path, meta=meta,
+                           save_every=save_every, resume=resume)
 
-    return model, history
+    return trainer.model, history
 
 
 def plot_training_curves(history):
@@ -84,7 +117,7 @@ def plot_training_curves(history):
 
 def plot_long_range_prediction(model, physics, T):
     y0, u_seq, y_true = build_validation_trajectory(physics, T, n_steps=20, seed=1)
-    y_pred = pinc_rollout(model, y0, u_seq)
+    y_pred = pinc_rollout(model, y0, u_seq)  # rollout moves inputs to model's device internally
 
     t_axis = torch.arange(y_pred.shape[0]) * T
 
@@ -117,10 +150,61 @@ def integral_metrics(y_ref, y):
     return rmse, iae
 
 
+def _solve_nmpc_worker(kind, model, physics, T, y0, y_ref, control_dim,
+                        N1, N2, Nu, Q, R, u_min, u_max, maxiter):
+    """
+    Runs a single closed-loop NMPC simulation in its own process.
+
+    `kind` selects which predictive model drives the controller:
+      - "pinc" : the trained PINC net (`model`, already CPU-resident)
+      - "ode"  : a fresh RK4 predictive interface, also used as the
+                 plant here (matches the original Van der Pol
+                 experiment, which -- unlike the four-tank one --
+                 uses the same substep count for both)
+
+    The RK4 interface is rebuilt here rather than passed in, since the
+    nested closure `rk4_control_interface` returns isn't reliably
+    picklable across a process boundary.
+
+    torch.set_num_threads(1) keeps each worker from spinning up its own
+    intra-op thread pool -- with tensors this small (batch size 1) that
+    overhead is pure contention on top of the process-level
+    parallelism, not useful compute.
+    """
+    torch.set_num_threads(1)
+
+    if kind == "pinc":
+        control_interface = model.step
+        plant = rk4_control_interface(physics, T, substeps=20)
+    else:
+        rk_interface = rk4_control_interface(physics, T, substeps=20)
+        control_interface = rk_interface
+        plant = rk_interface
+
+    t0 = time.time()
+    y, u = run_nmpc_simulation(
+        control_interface=control_interface,
+        plant_step=plant,
+        y0=y0, y_ref_full=y_ref, control_dim=control_dim,
+        N1=N1, N2=N2, Nu=Nu, Q=Q, R=R, u_min=u_min, u_max=u_max,
+        maxiter=maxiter,
+        desc="PINC" if kind == "pinc" else "ODE/RK", position=0 if kind == "pinc" else 1,
+    )
+    elapsed = time.time() - t0
+    return y, u, elapsed
+
+
 def run_control_experiment(model, physics, T, n_steps=120):
     """Fig. 10 / Table 1 style experiment: regulate x1, x2 to zero via NMPC,
     using PINC as the predictive model, and compare against the ODE/RK4
-    baseline predictive model."""
+    baseline predictive model.
+
+    NMPC solves go through scipy.optimize (CPU-only, numpy-backed), so
+    the model is moved to CPU here regardless of what device it was
+    trained on -- there's no benefit to keeping it on GPU for the tiny,
+    Python-overhead-dominated per-step solves in `nmpc.py`.
+    """
+    model = model.to("cpu")
 
     y_ref = torch.zeros(n_steps, 2)  # reference: keep x1 = x2 = 0
 
@@ -132,26 +216,19 @@ def run_control_experiment(model, physics, T, n_steps=120):
     N1, N2, Nu = 1, 5, 5
     u_min, u_max = [-1.0], [1.0]
 
-    # --- PINC-based NMPC ---
-    t0 = time.time()
-    y_pinc, u_pinc = run_nmpc_simulation(
-        control_interface=model.step,
-        plant_step=rk4_control_interface(physics, T, substeps=20),
-        y0=y0, y_ref_full=y_ref, control_dim=1,
-        N1=N1, N2=N2, Nu=Nu, Q=Q, R=R, u_min=u_min, u_max=u_max,
-    )
-    t_pinc = time.time() - t0
+    # The PINC-driven and ODE/RK-driven NMPC runs are fully independent
+    # (same reference, no shared mutable state), so run them in separate
+    # processes instead of back-to-back -- each one otherwise pins a
+    # single core for the whole simulation.
+    common = dict(physics=physics, T=T, y0=y0, y_ref=y_ref, control_dim=1,
+                  N1=N1, N2=N2, Nu=Nu, Q=Q, R=R, u_min=u_min, u_max=u_max,
+                  maxiter=30)
 
-    # --- ODE/RK4-based NMPC (baseline, uses the true model as predictor) ---
-    rk_interface = rk4_control_interface(physics, T, substeps=20)
-    t0 = time.time()
-    y_ode, u_ode = run_nmpc_simulation(
-        control_interface=rk_interface,
-        plant_step=rk_interface,
-        y0=y0, y_ref_full=y_ref, control_dim=1,
-        N1=N1, N2=N2, Nu=Nu, Q=Q, R=R, u_min=u_min, u_max=u_max,
-    )
-    t_ode = time.time() - t0
+    with ProcessPoolExecutor(max_workers=2) as ex:
+        fut_pinc = ex.submit(_solve_nmpc_worker, "pinc", model, **common)
+        fut_ode = ex.submit(_solve_nmpc_worker, "ode", model, **common)
+        y_pinc, u_pinc, t_pinc = fut_pinc.result()
+        y_ode, u_ode, t_ode = fut_ode.result()
 
     rmse_pinc, iae_pinc = integral_metrics(y_ref, y_pinc[1:])
     rmse_ode, iae_ode = integral_metrics(y_ref, y_ode[1:])
@@ -185,13 +262,37 @@ def run_control_experiment(model, physics, T, n_steps=120):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu",
+                         help="training device, e.g. 'cpu', 'cuda', 'cuda:0' (default: auto-detect)")
+    parser.add_argument("--checkpoint", default="checkpoints/vanderpol.pt",
+                         help="path to save/load the training checkpoint")
+    parser.add_argument("--resume", action="store_true",
+                         help="resume training from --checkpoint if it exists")
+    parser.add_argument("--no-checkpoint", action="store_true",
+                         help="disable checkpointing entirely")
+    parser.add_argument("--load-only", default=None,
+                         help="skip training entirely and load a trained model from this "
+                              "checkpoint path (e.g. for re-running the control experiment only)")
+    args = parser.parse_args()
+
     physics = VanDerPol(mu=1.0)
     T = 0.5
 
-    print("Training PINC net for the Van der Pol oscillator...")
-    model, history = train_pinc(physics, T, k1_epochs=5000, k2_iters=2000)
+    if args.load_only:
+        print(f"Loading trained model from '{args.load_only}' (skipping training)...")
+        model, payload = load_pinc_model(args.load_only, map_location="cpu")
+        history = payload["extra"].get("history")
+    else:
+        print(f"Training PINC net for the Van der Pol oscillator on device='{args.device}'...")
+        checkpoint_path = None if args.no_checkpoint else args.checkpoint
+        model, history = train_pinc(physics, T, k1_epochs=500, k2_iters=2000,
+                                     device=args.device,
+                                     checkpoint_path=checkpoint_path,
+                                     resume=args.resume)
 
-    plot_training_curves(history)
+    if history is not None:
+        plot_training_curves(history)
     plot_long_range_prediction(model, physics, T)
     run_control_experiment(model, physics, T)
 

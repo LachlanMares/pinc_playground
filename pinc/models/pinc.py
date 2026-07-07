@@ -58,5 +58,4 @@ class PINCModel(BaseModel):
         """
         n = y_prev.shape[0]
         t_T = torch.full((n, 1), self.T, dtype=y_prev.dtype, device=y_prev.device)
-
         return self.forward(t_T, y_prev, u)

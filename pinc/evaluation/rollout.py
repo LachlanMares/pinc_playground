@@ -1,6 +1,10 @@
 import torch
 
 
+def _model_device(model):
+    return next(model.parameters()).device
+
+
 @torch.no_grad()
 def pinc_rollout(model, y0, u_sequence):
     """
@@ -16,8 +20,16 @@ def pinc_rollout(model, y0, u_sequence):
     y0         : (state_dim,) initial state
     u_sequence : (n_steps, control_dim)
 
+    Inputs are moved to whatever device the model's parameters live on
+    (so callers don't need to care whether the model is on CPU or GPU);
+    the returned trajectory is moved back to CPU for easy plotting.
+
     returns traj : (n_steps + 1, state_dim)
     """
+    device = _model_device(model)
+    y0 = y0.to(device)
+    u_sequence = u_sequence.to(device)
+
     y = y0.unsqueeze(0)
     traj = [y0]
 
@@ -26,7 +38,7 @@ def pinc_rollout(model, y0, u_sequence):
         y = model.step(y, u_in)
         traj.append(y[0])
 
-    return torch.stack(traj)
+    return torch.stack(traj).cpu()
 
 
 @torch.no_grad()
@@ -37,4 +49,4 @@ def mse_gen(model, y0, u_sequence, y_true):
     rollout against the true (RK4) trajectory under the same control input.
     """
     y_pred = pinc_rollout(model, y0, u_sequence)
-    return torch.mean((y_pred - y_true) ** 2).item()
+    return torch.mean((y_pred - y_true.cpu()) ** 2).item()
