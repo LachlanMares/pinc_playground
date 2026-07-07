@@ -205,7 +205,7 @@ def main():
     T = 10.0
 
     print("Training PINC net for the four-tank system...")
-    model, history = train_pinc(physics, T, k1_epochs=500, k2_iters=2000)
+    model, history = train_pinc(physics, T, k1_epochs=5000, k2_iters=2000)
 
     plot_training_curves(history)
     plot_long_range_prediction(model, physics, T)
