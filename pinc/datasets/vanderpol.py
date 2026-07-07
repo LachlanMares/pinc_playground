@@ -1,41 +1,28 @@
 import torch
 
-
-def rk4(f, x, u, dt):
-    k1 = f(x, u)
-    k2 = f(x + 0.5 * dt * k1, u)
-    k3 = f(x + 0.5 * dt * k2, u)
-    k4 = f(x + dt * k3, u)
-
-    return x + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+from pinc.datasets.pinc_dataset import PINCSampler
 
 
-class VanDerPolDataset:
-    def __init__(self, physics, T=50, dt=0.05, trajectories=200):
-        self.physics = physics
-        self.T = T
-        self.dt = dt
-        self.trajectories = trajectories
+def make_vanderpol_sampler(physics, T):
+    """
+    Sampling ranges used in Sec. 4.1 of the paper for the Van der Pol
+    oscillator: u in [-1, 1], x1, x2 in [-3, 3].
+    """
+    y_range = [(-3.0, 3.0), (-3.0, 3.0)]
+    u_range = [(-1.0, 1.0)]
+    return PINCSampler(physics, T=T, y_range=y_range, u_range=u_range)
 
-    def generate(self):
-        X, U, Y = [], [], []
 
-        for _ in range(self.trajectories):
-            x = torch.randn(2) * 2.0
+def random_control_signal(n_steps, control_dim=1, u_range=(-1.0, 1.0), hold=1, seed=None):
+    """
+    Generates a piecewise-constant random control sequence, used to
+    excite/evaluate the trained network (as in Fig. 9) and as a plant
+    input for open-loop long-range simulation (Fig. 6).
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
 
-            for _ in range(self.T):
-                u = torch.randn(1) * 0.5
-
-                x_next = rk4(self.physics.dynamics, x, u, self.dt)
-
-                X.append(x)
-                U.append(u)
-                Y.append(x_next)
-
-                x = x_next
-
-        return (
-            torch.stack(X).float(),
-            torch.stack(U).float(),
-            torch.stack(Y).float(),
-        )
+    n_holds = n_steps // hold + 1
+    values = torch.empty(n_holds, control_dim).uniform_(*u_range)
+    u = values.repeat_interleave(hold, dim=0)[:n_steps]
+    return u
