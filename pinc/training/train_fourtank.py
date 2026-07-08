@@ -1,19 +1,5 @@
-"""
-Reproduces the four-tank system experiments of Section 4.2 of Antonelo
-et al. (arXiv:2104.02556):
-
-  1) Train a PINC net (5 hidden layers, 20 neurons, T = 10s) for the
-     quadruple-tank process.
-  2) Long-range self-loop prediction on a random control signal (Fig. 12).
-  3) Closed-loop NMPC regulating h1, h2 to setpoints, with h3, h4
-     constrained to [0.6, 5.5] cm (Fig. 13), compared against the
-     ODE/RK4 baseline predictive model (Fig. 14, Table 1).
-
-Run with:  python -m pinc.training.train_fourtank
-"""
 import argparse
 import time
-from concurrent.futures import ProcessPoolExecutor
 
 import torch
 import matplotlib.pyplot as plt
@@ -44,8 +30,30 @@ def build_validation_trajectory(physics, T, n_steps=35, seed=0):
     return y0, u_seq, y_true
 
 
-def train_pinc(physics, T, k1_epochs=500, k2_iters=2000, hidden=20, depth=5,
-               n_boundary=1000, n_collocation=100000, lambda_phys=1.0,
+def build_easy_validation_trajectory(physics, T, n_steps=35, u_const=2.5):
+    """
+    Simpler long-range test than `build_validation_trajectory`: a single
+    constant pump voltage on both channels instead of a fresh random
+    setpoint every step. Use this to separate two failure modes that
+    are otherwise tangled together in the random-signal plot:
+      1) self-loop error compounding step-to-step even under a simple,
+         unchanging input, vs.
+      2) the network reacting poorly to input *changes* it may be
+         under-sampled on.
+    If PINC tracks this trajectory well but still diverges on the
+    random-signal one, look at input-transition coverage in the
+    collocation sampler; if it already diverges here, look at
+    `lambda_multistep` / multistep_k / network capacity instead.
+    """
+    y0 = torch.tensor([8.0, 8.0, 8.0, 8.0])
+    u_seq = torch.full((n_steps, physics.control_dim), u_const)
+    y_true = simulate(physics, y0, u_seq, dt=T, substeps=20)
+    return y0, u_seq, y_true
+
+
+def train_pinc(physics, T, k1_epochs=500, k2_iters=2000, hidden=128, depth=3,
+               n_boundary=4000, n_collocation=100000,
+               n_multistep=4000, multistep_k=3, lambda_phys=1.0,
                device="cpu", checkpoint_path=None, resume=False, save_every=100):
     """
     device          : "cpu", "cuda", or "cuda:N" -- see the note in
@@ -53,6 +61,21 @@ def train_pinc(physics, T, k1_epochs=500, k2_iters=2000, hidden=20, depth=5,
                        net (5 x 20) is still small, but with
                        n_collocation=100000 points per iteration a GPU
                        can meaningfully speed up training.
+    n_boundary, n_collocation, n_multistep, multistep_k :
+                       batch sizes for the three loss terms in
+                       PINCLoss (boundary/physics, endpoint reuses the
+                       boundary batch, multistep gets its own batch of
+                       n_multistep chains of length multistep_k). All
+                       three are independent per-sample computations
+                       (only multistep_k is a short *sequential* chain
+                       within each sample), so raising n_boundary /
+                       n_collocation / n_multistep is the most direct
+                       way to give the GPU more parallel work per
+                       iteration if utilization looks low -- try
+                       increasing these before reaching for a bigger
+                       network, and watch `nvidia-smi` (or `nvtop`) to
+                       see where utilization actually saturates for
+                       your GPU.
     checkpoint_path : if given, periodically saves training progress
                        here so a killed/interrupted run can be resumed.
     resume          : if True and a checkpoint already exists at
@@ -76,8 +99,9 @@ def train_pinc(physics, T, k1_epochs=500, k2_iters=2000, hidden=20, depth=5,
         T=T,
     )
 
-    sampler = make_fourtank_sampler(physics, T)
-    loss_fn = PINCLoss(physics, lambda_phys=lambda_phys)
+    sampler = make_fourtank_sampler(physics, T, device=device)
+    loss_fn = PINCLoss(physics, T=T, lambda_phys=lambda_phys,
+                       lambda_endpoint=1.0, lambda_multistep=1.0)
 
     y0_val, u_val, y_true_val = build_validation_trajectory(physics, T)
 
@@ -86,10 +110,11 @@ def train_pinc(physics, T, k1_epochs=500, k2_iters=2000, hidden=20, depth=5,
 
     trainer = Trainer(model, sampler, loss_fn,
                        n_boundary=n_boundary, n_collocation=n_collocation,
+                       n_multistep=n_multistep, multistep_k=multistep_k,
                        lr=1e-3, device=device)
 
     history = trainer.fit(k1_epochs=k1_epochs, k2_iters=k2_iters,
-                           validate_fn=validate_fn, log_every=max(1, k1_epochs // 10),
+                           validate_fn=validate_fn,
                            checkpoint_path=checkpoint_path, meta=meta,
                            save_every=save_every, resume=resume)
 
@@ -101,6 +126,8 @@ def plot_training_curves(history):
     plt.semilogy(history["total"], label="Total")
     plt.semilogy(history["data"], label="Data (MSE_y)")
     plt.semilogy(history["physics"], label="Physics (MSE_F)")
+    plt.semilogy(history["endpoint"], label="Endpoint (MSE, t=T vs RK4)")
+    plt.semilogy(history["multistep"], label="Multistep (chained rollout vs RK4)")
     plt.xlabel("Iteration")
     plt.ylabel("MSE (log scale)")
     plt.title("PINC training loss - Four tanks")
@@ -112,33 +139,85 @@ def plot_training_curves(history):
 
 
 def plot_long_range_prediction(model, physics, T):
-    y0, u_seq, y_true = build_validation_trajectory(physics, T, n_steps=35, seed=1)
-    y_pred = pinc_rollout(model, y0, u_seq)
+    """
+    Writes two 4-row x 2-col diagnostic figures (rows: true / PINC
+    prediction / combined / abs error; columns: h1&h2 / h3&h4), same
+    idea as the Van der Pol version:
+
+      - fourtank_long_range_prediction.png      : random control signal
+      - fourtank_long_range_prediction_easy.png : constant control input
+
+    Row 4 (abs error) is the one to actually check: flat/small on both
+    -> self-loop is fine. Growing on the constant-input version too ->
+    genuine compounding self-loop error (raise lambda_multistep /
+    multistep_k). Growing only on the random-signal version -> input-
+    transition coverage in the collocation sampler, not the self-loop
+    mechanism itself.
+    """
+    _plot_rollout_diagnostic(
+        model, physics, T,
+        *build_validation_trajectory(physics, T, n_steps=35, seed=1),
+        title="PINC self-loop vs true (random control signal)",
+        out_path="fourtank_long_range_prediction.png",
+    )
+    _plot_rollout_diagnostic(
+        model, physics, T,
+        *build_easy_validation_trajectory(physics, T, n_steps=35, u_const=2.5),
+        title="PINC self-loop vs true (constant u1=u2=2.5)",
+        out_path="fourtank_long_range_prediction_easy.png",
+    )
+
+
+def _plot_rollout_diagnostic(model, physics, T, y0, u_seq, y_true, title, out_path):
+    y_pred = pinc_rollout(model, y0, u_seq).detach()
     t_axis = torch.arange(y_pred.shape[0]) * T
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    axes[0].plot(t_axis, y_true[:, 0], "k-", label="true h1")
-    axes[0].plot(t_axis, y_true[:, 1], "k--", label="true h2")
-    axes[0].plot(t_axis, y_pred[:, 0].detach(), "o-", color="tab:blue", label="PINC h1")
-    axes[0].plot(t_axis, y_pred[:, 1].detach(), "o-", color="tab:pink", label="PINC h2")
-    axes[0].set_xlabel("Time (s)")
-    axes[0].set_ylabel("h1, h2")
-    axes[0].legend()
+    col_specs = [
+        (0, 1, "h1", "h2", "h1, h2"),
+        (2, 3, "h3", "h4", "h3, h4"),
+    ]
 
-    axes[1].plot(t_axis, y_true[:, 2], "k-", label="true h3")
-    axes[1].plot(t_axis, y_true[:, 3], "k--", label="true h4")
-    axes[1].plot(t_axis, y_pred[:, 2].detach(), "o-", color="tab:blue", label="PINC h3")
-    axes[1].plot(t_axis, y_pred[:, 3].detach(), "o-", color="tab:pink", label="PINC h4")
-    axes[1].set_xlabel("Time (s)")
-    axes[1].set_ylabel("h3, h4")
-    axes[1].legend()
+    fig, axes = plt.subplots(4, 2, figsize=(13, 12), sharex=True)
 
+    for c, (i, j, name_i, name_j, ylabel) in enumerate(col_specs):
+        ylim = (min(y_true[:, i].min(), y_true[:, j].min(), y_pred[:, i].min(), y_pred[:, j].min()) - 0.5,
+                max(y_true[:, i].max(), y_true[:, j].max(), y_pred[:, i].max(), y_pred[:, j].max()) + 0.5)
+
+        ax = axes[0, c]
+        ax.plot(t_axis, y_true[:, i], "k-", label=f"true {name_i}")
+        ax.plot(t_axis, y_true[:, j], "k--", label=f"true {name_j}")
+        ax.set_ylabel(ylabel); ax.set_ylim(*ylim); ax.legend(fontsize=8)
+        ax.set_title(f"1. True (RK4) -- {ylabel}")
+
+        ax = axes[1, c]
+        ax.plot(t_axis, y_pred[:, i], "o-", color="tab:blue", label=f"PINC {name_i}")
+        ax.plot(t_axis, y_pred[:, j], "o-", color="tab:pink", label=f"PINC {name_j}")
+        ax.set_ylabel(ylabel); ax.set_ylim(*ylim); ax.legend(fontsize=8)
+        ax.set_title(f"2. PINC prediction -- {ylabel}")
+
+        ax = axes[2, c]
+        ax.plot(t_axis, y_true[:, i], "-", color="black", linewidth=1, alpha=0.6)
+        ax.plot(t_axis, y_true[:, j], "--", color="black", linewidth=1, alpha=0.6)
+        ax.plot(t_axis, y_pred[:, i], "o", color="tab:blue", markersize=4, label=f"PINC {name_i}")
+        ax.plot(t_axis, y_pred[:, j], "o", color="tab:pink", markersize=4, label=f"PINC {name_j}")
+        ax.set_ylabel(ylabel); ax.set_ylim(*ylim); ax.legend(fontsize=8)
+        ax.set_title(f"3. Combined -- {ylabel}")
+
+        ax = axes[3, c]
+        err_i = (y_pred[:, i] - y_true[:, i]).abs()
+        err_j = (y_pred[:, j] - y_true[:, j]).abs()
+        ax.plot(t_axis, err_i, "o-", color="tab:blue", label=f"|error| {name_i}")
+        ax.plot(t_axis, err_j, "o-", color="tab:pink", label=f"|error| {name_j}")
+        ax.set_ylabel("abs error"); ax.set_xlabel("Time (s)"); ax.legend(fontsize=8)
+        ax.set_title(f"4. Per-step error -- {ylabel} (should stay flat/small)")
+
+    fig.suptitle(title)
     plt.tight_layout()
-    plt.savefig("fourtank_long_range_prediction.png", dpi=150)
+    plt.savefig(out_path, dpi=150)
     plt.close()
 
     mse = torch.mean((y_pred - y_true) ** 2).item()
-    print(f"Long-range self-loop generalization MSE: {mse:.3e}")
+    print(f"[{out_path}] Long-range self-loop generalization MSE: {mse:.3e}")
 
 
 def integral_metrics(y_ref, y):
@@ -223,7 +302,7 @@ def run_control_experiment(model, physics, T, n_steps=45):
     y_ref[n_steps // 2:, 0] = 8.0
     y_ref[n_steps // 2:, 1] = 12.5
 
-    y0 = torch.tensor([2.0, 2.0, 2.0, 2.0])
+    y0 = torch.tensor([8.0, 8.0, 8.0, 8.0])
 
     Q = torch.diag(torch.tensor([10.0, 10.0, 0.0, 0.0]))
     R = torch.diag(torch.tensor([1.0, 1.0]))
@@ -240,11 +319,11 @@ def run_control_experiment(model, physics, T, n_steps=45):
                   N1=N1, N2=N2, Nu=Nu, Q=Q, R=R, u_min=u_min, u_max=u_max,
                   state_constraints=state_constraints, maxiter=80)
 
-    with ProcessPoolExecutor(max_workers=2) as ex:
-        fut_pinc = ex.submit(_solve_nmpc_worker, "pinc", model, **common)
-        fut_ode = ex.submit(_solve_nmpc_worker, "ode", model, **common)
-        y_pinc, u_pinc, t_pinc = fut_pinc.result()
-        y_ode, u_ode, t_ode = fut_ode.result()
+    y_pinc, u_pinc, t_pinc = _solve_nmpc_worker(kind="pinc", model=model, **common)
+
+    print("Running RK4 NMPC...")
+
+    y_ode, u_ode, t_ode = _solve_nmpc_worker(kind="ode",model=model, **common)
 
     rmse_pinc, iae_pinc = integral_metrics(y_ref[:, :2], y_pinc[1:, :2])
     rmse_ode, iae_ode = integral_metrics(y_ref[:, :2], y_ode[1:, :2])
@@ -301,11 +380,13 @@ def main():
                          help="training device, e.g. 'cpu', 'cuda', 'cuda:0' (default: auto-detect)")
     parser.add_argument("--checkpoint", default="checkpoints/fourtank.pt",
                          help="path to save/load the training checkpoint")
-    parser.add_argument("--resume", action="store_true", default=True,
-                         help="resume training from --checkpoint if it exists")
-    parser.add_argument("--no-checkpoint", action="store_true",
+    parser.add_argument("--resume", dest="resume", action="store_true", default=True,
+                         help="resume training from --checkpoint if it exists (default)")
+    parser.add_argument("--no-resume", dest="resume", action="store_false",
+                         help="ignore any existing checkpoint and train from scratch")
+    parser.add_argument("--no-checkpoint", action="store_true", default=False,
                          help="disable checkpointing entirely")
-    parser.add_argument("--load-only", default=None,
+    parser.add_argument("--load-only", default="checkpoints/fourtank.pt",
                          help="skip training entirely and load a trained model from this "
                               "checkpoint path (e.g. for re-running the control experiment only)")
     args = parser.parse_args()
@@ -320,8 +401,8 @@ def main():
     else:
         print(f"Training PINC net for the four-tank system on device='{args.device}'...")
         checkpoint_path = None if args.no_checkpoint else args.checkpoint
-        print(f"{checkpoint_path=} {args.resume=}")
-        model, history = train_pinc(physics, T, k1_epochs=5000, k2_iters=2000,
+
+        model, history = train_pinc(physics, T, k1_epochs=25000, k2_iters=3000,
                                      device=args.device,
                                      checkpoint_path=checkpoint_path,
                                      resume=args.resume)
@@ -332,7 +413,8 @@ def main():
     run_control_experiment(model, physics, T)
 
     print("\nSaved figures: fourtank_training_curves.png, "
-          "fourtank_long_range_prediction.png, fourtank_nmpc_control.png")
+          "fourtank_long_range_prediction.png, fourtank_long_range_prediction_easy.png, "
+          "fourtank_nmpc_control.png")
 
 
 if __name__ == "__main__":

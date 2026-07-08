@@ -18,7 +18,6 @@ Train on GPU (if available):
 """
 import argparse
 import time
-from concurrent.futures import ProcessPoolExecutor
 
 import torch
 import matplotlib.pyplot as plt
@@ -35,16 +34,43 @@ from pinc.control.nmpc import run_nmpc_simulation
 from pinc.utils.checkpoint import load_pinc_model
 
 
-def build_validation_trajectory(physics, T, n_steps=180, seed=0):
+def build_validation_trajectory(physics: VanDerPol, T: float, n_steps: int = 180, seed: int = 0):
     torch.manual_seed(seed)
     y0 = torch.tensor([-2.14, 0.25])
     u_seq = random_control_signal(n_steps, control_dim=1, u_range=(-1.0, 1.0), seed=seed)
     y_true = simulate(physics, y0, u_seq, dt=T, substeps=20)
+
     return y0, u_seq, y_true
 
 
-def train_pinc(physics, T, k1_epochs=500, k2_iters=2000, hidden=20, depth=4,
-               n_boundary=1000, n_collocation=100000, lambda_phys=1.0,
+def build_easy_validation_trajectory(physics: VanDerPol, T, n_steps=20, u_const=0.0):
+    """
+    A much simpler long-range test than `build_validation_trajectory`:
+    a single constant input (default u=0, i.e. the free/unforced Van der
+    Pol oscillator) instead of a rapidly-switching random signal.
+
+    Use this to separate two different failure modes that otherwise get
+    tangled together in the random-signal plot:
+      1) self-loop error compounding step-to-step even when the system
+         is doing something simple/smooth, vs.
+      2) the network reacting poorly to input *changes* it may be
+         under-sampled on (large or frequent jumps in u).
+    If PINC tracks this trajectory well but still diverges on the
+    random-signal one, the problem is more likely (2); if it already
+    diverges here, it's (1) -- e.g. insufficient multistep-loss weight,
+    or the collocation sampler not covering the states actually visited
+    once errors start compounding.
+    """
+    y0 = torch.tensor([-2.14, 0.25])
+    u_seq = torch.full((n_steps, physics.control_dim), u_const)
+    y_true = simulate(physics, y0, u_seq, dt=T, substeps=20)
+
+    return y0, u_seq, y_true
+
+
+def train_pinc(physics: VanDerPol, T, k1_epochs=500, k2_iters=2000, hidden=20, depth=4,
+               n_boundary=4000, n_collocation=100000,
+               n_multistep=4000, multistep_k=3, lambda_phys=1.0,
                device="cpu", checkpoint_path=None, resume=False, save_every=100):
     """
     device          : "cpu", "cuda", or "cuda:N". Training (the ADAM/
@@ -54,6 +80,15 @@ def train_pinc(physics, T, k1_epochs=500, k2_iters=2000, hidden=20, depth=4,
                       `run_control_experiment`) since they're dominated
                       by small per-step SciPy/autograd overhead rather
                       than raw matmul throughput.
+    n_boundary, n_collocation, n_multistep, multistep_k :
+                      batch sizes for the three loss terms in PINCLoss.
+                      All independent per-sample work (aside from the
+                      short length-multistep_k sequential chain within
+                      each multistep sample), so raising these is the
+                      most direct way to give the GPU more parallel
+                      work per iteration if utilization looks low --
+                      try this before enlarging the network, and check
+                      `nvidia-smi`/`nvtop` to see where it saturates.
     checkpoint_path : if given, periodically saves training progress
                       here so a killed/interrupted run can be resumed.
     resume          : if True and a checkpoint already exists at
@@ -77,8 +112,9 @@ def train_pinc(physics, T, k1_epochs=500, k2_iters=2000, hidden=20, depth=4,
         T=T,
     )
 
-    sampler = make_vanderpol_sampler(physics, T)
-    loss_fn = PINCLoss(physics, lambda_phys=lambda_phys)
+    sampler = make_vanderpol_sampler(physics, T, device=device)
+    loss_fn = PINCLoss(physics, T=T, lambda_phys=lambda_phys,
+                       lambda_endpoint=1.0, lambda_multistep=1.0)
 
     y0_val, u_val, y_true_val = build_validation_trajectory(physics, T)
 
@@ -87,10 +123,11 @@ def train_pinc(physics, T, k1_epochs=500, k2_iters=2000, hidden=20, depth=4,
 
     trainer = Trainer(model, sampler, loss_fn,
                        n_boundary=n_boundary, n_collocation=n_collocation,
+                       n_multistep=n_multistep, multistep_k=multistep_k,
                        lr=1e-3, device=device)
 
     history = trainer.fit(k1_epochs=k1_epochs, k2_iters=k2_iters,
-                           validate_fn=validate_fn, log_every=max(1, k1_epochs // 10),
+                           validate_fn=validate_fn,
                            checkpoint_path=checkpoint_path, meta=meta,
                            save_every=save_every, resume=resume)
 
@@ -102,6 +139,8 @@ def plot_training_curves(history):
     plt.semilogy(history["total"], label="Total")
     plt.semilogy(history["data"], label="Data (MSE_y)")
     plt.semilogy(history["physics"], label="Physics (MSE_F)")
+    plt.semilogy(history["endpoint"], label="Endpoint (MSE, t=T vs RK4)")
+    plt.semilogy(history["multistep"], label="Multistep (chained rollout vs RK4)")
     val = [v for v in history["val"] if v is not None]
     if val:
         plt.semilogy(range(len(history["total"]) - len(val), len(history["total"])), val, label="Validation")
@@ -116,27 +155,82 @@ def plot_training_curves(history):
 
 
 def plot_long_range_prediction(model, physics, T):
-    y0, u_seq, y_true = build_validation_trajectory(physics, T, n_steps=20, seed=1)
-    y_pred = pinc_rollout(model, y0, u_seq)  # rollout moves inputs to model's device internally
+    _plot_rollout_diagnostic(
+        model, physics, T,
+        *build_validation_trajectory(physics, T, n_steps=20, seed=1),
+        title="PINC self-loop vs true (random-switching input)",
+        out_path="vanderpol_long_range_prediction.png",
+    )
+    _plot_rollout_diagnostic(
+        model, physics, T,
+        *build_easy_validation_trajectory(physics, T, n_steps=20, u_const=0.0),
+        title="PINC self-loop vs true (constant u=0, unforced)",
+        out_path="vanderpol_long_range_prediction_easy.png",
+    )
 
+
+def _plot_rollout_diagnostic(model, physics, T, y0, u_seq, y_true, title, out_path):
+    """
+    Four-panel diagnostic, replacing the old single-overlay plot (where
+    the true and predicted curves drew on top of each other and it was
+    hard to tell whether they matched or one was just hidden under the
+    other):
+
+      1) True trajectory alone
+      2) PINC prediction alone (same axis limits as panel 1, so shape/
+         scale differences are visible at a glance)
+      3) Both overlaid, true as thin black lines, PINC as markers on top
+      4) Per-step absolute error, x1 and x2 separately
+
+    Panel 4 is the one to actually look at for a pass/fail read: it
+    should be small and roughly flat/decaying, not visibly growing
+    step-by-step. Growth there is compounding self-loop error even if
+    panels 1-3 "look" close at this scale.
+    """
+    y_pred = pinc_rollout(model, y0, u_seq).detach()
     t_axis = torch.arange(y_pred.shape[0]) * T
+    ylim = (min(y_true.min(), y_pred.min()) - 0.3, max(y_true.max(), y_pred.max()) + 0.3)
 
-    fig, ax1 = plt.subplots(figsize=(8, 5))
-    ax1.plot(t_axis, y_true[:, 0], "k-", label="true x1")
-    ax1.plot(t_axis, y_true[:, 1], "k--", label="true x2")
-    ax1.plot(t_axis, y_pred[:, 0].detach(), "o-", color="tab:blue", label="PINC x1")
-    ax1.plot(t_axis, y_pred[:, 1].detach(), "o-", color="tab:pink", label="PINC x2")
-    ax1.set_xlabel("Time (s)")
-    ax1.set_ylabel("outputs y1, y2")
-    ax1.legend(loc="upper left")
-    ax1.set_title("PINC net prediction for the Van der Pol oscillator (self-loop)")
+    fig, axes = plt.subplots(4, 1, figsize=(8, 12), sharex=True)
 
-    ax2 = ax1.twinx()
-    ax2.step(t_axis[:-1], u_seq[:, 0], where="post", color="grey", linestyle="--", alpha=0.6)
-    ax2.set_ylabel("input u", color="grey")
+    ax = axes[0]
+    ax.plot(t_axis, y_true[:, 0], "k-", label="true x1")
+    ax.plot(t_axis, y_true[:, 1], "k--", label="true x2")
+    ax.set_ylabel("state")
+    ax.set_ylim(*ylim)
+    ax.legend(loc="upper right", fontsize=8)
+    ax.set_title("1. True (RK4) trajectory")
 
+    ax = axes[1]
+    ax.plot(t_axis, y_pred[:, 0], "o-", color="tab:blue", label="PINC x1")
+    ax.plot(t_axis, y_pred[:, 1], "o-", color="tab:pink", label="PINC x2")
+    ax.set_ylabel("state")
+    ax.set_ylim(*ylim)
+    ax.legend(loc="upper right", fontsize=8)
+    ax.set_title("2. PINC self-loop prediction")
+
+    ax = axes[2]
+    ax.plot(t_axis, y_true[:, 0], "-", color="black", linewidth=1, alpha=0.6)
+    ax.plot(t_axis, y_true[:, 1], "--", color="black", linewidth=1, alpha=0.6)
+    ax.plot(t_axis, y_pred[:, 0], "o", color="tab:blue", markersize=4, label="PINC x1")
+    ax.plot(t_axis, y_pred[:, 1], "o", color="tab:pink", markersize=4, label="PINC x2")
+    ax.set_ylabel("state")
+    ax.set_ylim(*ylim)
+    ax.legend(loc="upper right", fontsize=8)
+    ax.set_title("3. Combined (thin black = true, dots = PINC)")
+
+    ax = axes[3]
+    err = (y_pred - y_true).abs()
+    ax.plot(t_axis, err[:, 0], "o-", color="tab:blue", label="|error| x1")
+    ax.plot(t_axis, err[:, 1], "o-", color="tab:pink", label="|error| x2")
+    ax.set_ylabel("abs error")
+    ax.set_xlabel("Time (s)")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.set_title("4. Per-step error -- should stay flat/small, not grow")
+
+    fig.suptitle(title)
     plt.tight_layout()
-    plt.savefig("vanderpol_long_range_prediction.png", dpi=150)
+    plt.savefig(out_path, dpi=150)
     plt.close()
 
     mse = torch.mean((y_pred - y_true) ** 2).item()
@@ -224,11 +318,21 @@ def run_control_experiment(model, physics, T, n_steps=120):
                   N1=N1, N2=N2, Nu=Nu, Q=Q, R=R, u_min=u_min, u_max=u_max,
                   maxiter=30)
 
-    with ProcessPoolExecutor(max_workers=2) as ex:
-        fut_pinc = ex.submit(_solve_nmpc_worker, "pinc", model, **common)
-        fut_ode = ex.submit(_solve_nmpc_worker, "ode", model, **common)
-        y_pinc, u_pinc, t_pinc = fut_pinc.result()
-        y_ode, u_ode, t_ode = fut_ode.result()
+    print("Running PINC NMPC...")
+
+    y_pinc, u_pinc, t_pinc = _solve_nmpc_worker(
+        "pinc",
+        model,
+        **common
+    )
+
+    print("Running RK4 NMPC...")
+
+    y_ode, u_ode, t_ode = _solve_nmpc_worker(
+        "ode",
+        model,
+        **common
+    )
 
     rmse_pinc, iae_pinc = integral_metrics(y_ref, y_pinc[1:])
     rmse_ode, iae_ode = integral_metrics(y_ref, y_ode[1:])
@@ -267,11 +371,13 @@ def main():
                          help="training device, e.g. 'cpu', 'cuda', 'cuda:0' (default: auto-detect)")
     parser.add_argument("--checkpoint", default="checkpoints/vanderpol.pt",
                          help="path to save/load the training checkpoint")
-    parser.add_argument("--resume", action="store_true",
-                         help="resume training from --checkpoint if it exists")
+    parser.add_argument("--resume", dest="resume", action="store_true", default=True,
+                         help="resume training from --checkpoint if it exists (default)")
+    parser.add_argument("--no-resume", dest="resume", action="store_false",
+                         help="ignore any existing checkpoint and train from scratch")
     parser.add_argument("--no-checkpoint", action="store_true",
                          help="disable checkpointing entirely")
-    parser.add_argument("--load-only", default=None,
+    parser.add_argument("--load-only", default="checkpoints/vanderpol.pt",
                          help="skip training entirely and load a trained model from this "
                               "checkpoint path (e.g. for re-running the control experiment only)")
     args = parser.parse_args()
@@ -279,14 +385,14 @@ def main():
     physics = VanDerPol(mu=1.0)
     T = 0.5
 
-    if args.load_only:
+    if args.load_only is not None:
         print(f"Loading trained model from '{args.load_only}' (skipping training)...")
         model, payload = load_pinc_model(args.load_only, map_location="cpu")
         history = payload["extra"].get("history")
     else:
         print(f"Training PINC net for the Van der Pol oscillator on device='{args.device}'...")
         checkpoint_path = None if args.no_checkpoint else args.checkpoint
-        model, history = train_pinc(physics, T, k1_epochs=500, k2_iters=2000,
+        model, history = train_pinc(physics, T, k1_epochs=10000, k2_iters=2000,
                                      device=args.device,
                                      checkpoint_path=checkpoint_path,
                                      resume=args.resume)

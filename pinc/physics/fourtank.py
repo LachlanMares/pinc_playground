@@ -19,6 +19,38 @@ class FourTank(PhysicsModel):
     operating point of Johansson (2000) (gamma1 + gamma2 < 1), the
     setting referenced in Sec. 4.2.1 of the paper. Adjust as needed to
     match a specific reproduction target.
+
+    A1, A2, A3, A4 = 28.0, 32.0, 28.0, 32.0 — cross-sectional area of each tank, in cm². This is the denominator in
+    every dynamics equation — it converts a flow (volume/time) into a rate of change of level (height/time): a bigger
+    tank means the same inflow/outflow moves the water level less. Note tanks 1&3 share one area (28) and 2&4 share
+    another (32) — a deliberate symmetry from the original Johansson benchmark, not a coincidence.
+
+    a1, a2, a3, a4 = 0.071, 0.057, 0.071, 0.057 — cross-sectional area of the outlet hole at the bottom of each tank,
+    in cm². This is the a_i in the Bernoulli orifice equation w_i = a_i·sqrt(2·g·h_i) — bigger hole means faster
+    drainage for the same water level. Same pairing pattern as A: tanks 1&3 share one hole size, 2&4 share another.
+
+    k1, k2 = 3.33, 3.35 — pump gain: how much flow (cm³/s) each pump produces per volt of input. This is why k1*u1
+    appears in the inflow terms — it converts the control signal (a voltage, u1 ∈ [0,5]) into an actual flow rate
+    before it gets split and added to the mass balance.
+
+    gamma1, gamma2 = 0.43, 0.34 — the split fraction for each pump's flow, and the single most important parameter for
+    how this system behaves. Pump 1's total flow k1*u1 doesn't go entirely to tank 1 — a fraction gamma1 goes to tank 1,
+    and the remaining (1-gamma1) is diverted to tank 4 instead (same idea for pump 2 → tanks 2 and 3, via gamma2).
+    This is the physical mechanism behind the cross-coupling we discussed last message: turning up u1 feeds tank 1
+    directly and indirectly refills tank 4, which then drains back into tank 1 later. Whether this system is "easy"
+    (minimum-phase) or "hard" (non-minimum-phase) to control hinges entirely on whether gamma1 + gamma2 is greater or
+    less than 1:
+
+    gamma1 + gamma2 > 1: most of each pump's flow goes to its "own" tank — well-behaved, minimum-phase.
+    gamma1 + gamma2 < 1 (your case: 0.43 + 0.34 = 0.77): most of each pump's flow is actually diverted to the other
+    tank's pair — this is the deliberately harder, non-minimum-phase operating point from the paper, where increasing
+    u1 can transiently make h1 dip before it rises, because the immediate direct contribution to tank 1 is smaller
+    than the delayed indirect contribution arriving via tank 4's drainage.
+
+    g = 981.0 — gravitational acceleration, but in cm/s² (not the more familiar 9.81 m/s²) — consistent with tank
+    levels and areas being specified in centimeters throughout this model. It only ever appears inside the sqrt(2·g·h)
+    orifice term, setting how fast water accelerates out through a hole at a given depth.
+
     """
 
     def __init__(self,
