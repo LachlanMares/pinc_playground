@@ -49,14 +49,16 @@ tanks) before deciding something's actually wrong.
 
 ## NMPC tests (closed-loop control)
 
-These wrap the same PINC net inside the NMPC controller from Antonelo et al.
-and run a full closed-loop simulation: at every timestep, solve for the best
-control move using the predictive model, apply it to the *real* RK4 plant,
-measure the outcome, repeat. Each scenario also runs the identical NMPC setup
-with the real ODE as the predictive model instead of PINC, so you get a direct
-"how much does using the learned network cost you, if anything" comparison on
-every scenario. These are much more expensive than the rollout tests (one
-constrained optimization solve per timestep), so there are fewer of them.
+These wrap the same PINC net inside an NMPC controller and run a full
+closed-loop simulation: at every timestep, solve for the best control move
+using the predictive model, apply it to the *real* RK4 plant, measure the
+outcome, repeat. By default each scenario runs four controller
+architectures side by side (PINC and an ODE/RK4 baseline, each solved via
+scipy/SLSQP, plus two CasADi/IPOPT variants of the PINC controller) — see
+"Comparing NMPC controller architectures" below for the full list and how
+to change it. These are much more expensive than the rollout tests (one
+constrained optimization solve per timestep, per architecture), so there
+are fewer scenarios.
 
 | Scenario | What it's testing |
 |---|---|
@@ -90,7 +92,49 @@ worth specifically comparing:
 
 ---
 
-## Adding your own scenario
+## Comparing NMPC controller architectures
+
+NMPC tests no longer only compare PINC vs. the ODE/RK baseline -- they can
+compare *any* combination of five controller architectures on the same
+scenario, via `--architectures`:
+
+| Key | What it is |
+|---|---|
+| `pinc` | PINC net as the predictive model, solved with scipy/SLSQP (the original `NMPCController`). |
+| `ode` | The true ODE/RK4 model as the predictive model, solved with scipy/SLSQP -- the ground-truth baseline. |
+| `pinc_casadi_single` | PINC net, solved with CasADi/IPOPT, single shooting (same problem as `pinc`, different/faster solver). |
+| `pinc_casadi_multi` | PINC net, solved with CasADi/IPOPT, true multiple shooting (predicted states are their own decision variables, tied by explicit equality constraints). Generally the most robust and fastest of the four full-NLP options. |
+| `pinc_casadi_rti` | PINC net, solved as a single linearized QP per timestep (Real-Time Iteration) via CasADi's built-in `qrqp`. **Opt-in only** -- see below. |
+
+Default (`--architectures` unset): `pinc,ode,pinc_casadi_single,pinc_casadi_multi`.
+
+```
+python -m pinc.testing.run_fourtank_tests --nmpc-only --architectures pinc,pinc_casadi_multi
+python -m pinc.testing.run_fourtank_tests --nmpc-only --architectures pinc_casadi_rti
+```
+
+`--skip-ode-baseline` and `--quick` both still work as shorthand for dropping
+`ode` from whatever architecture list is in effect.
+
+**Why `pinc_casadi_rti` isn't in the default set:** the four-tank orifice
+equation's `sqrt(h)` term has a steep, rapidly-varying local gradient. RTI
+linearizes once per timestep and reuses that single linear model across the
+*whole* prediction horizon without ever re-deriving it from the true
+nonlinear model mid-horizon -- and on this system that reliably drives the
+per-timestep QP infeasible partway through most scenarios (the controller
+silently falls back to holding its previous control action when that
+happens). It works fine on gentler systems, so it's still available -- pass
+it explicitly if you want to see that failure mode for yourself, or to
+confirm it on your own checkpoint.
+
+Every architecture in a comparison gets its own RMSE/IAE/time/violation
+columns in `nmpc_results.csv` and its own row-set in `report.md`'s NMPC
+table, and its own trace (color-coded by architecture, line-style-coded by
+tank/pump index) in each scenario's PNG.
+
+---
+
+
 
 Both scenario lists are plain Python dicts in `fourtank_scenarios.py`
 (`build_rollout_scenarios()` / `build_nmpc_scenarios()`) — copy an existing
