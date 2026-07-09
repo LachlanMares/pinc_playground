@@ -13,6 +13,11 @@ from pinc.datasets.fourtank import make_fourtank_sampler
 from pinc.evaluation.rollout import pinc_rollout, mse_gen
 from pinc.simulation.rk4 import simulate, rk4_control_interface
 from pinc.control.nmpc import run_nmpc_simulation
+from pinc.control.nmpc_casadi import (
+    CasadiSingleShootingNMPC,
+    CasadiMultipleShootingNMPC,
+    CasadiRTIController,
+)
 from pinc.utils.checkpoint import load_pinc_model
 
 
@@ -227,29 +232,53 @@ def integral_metrics(y_ref, y):
     return rmse, iae
 
 
-def _solve_nmpc_worker(kind, model, physics, T, y0, y_ref, control_dim,
-                        N1, N2, Nu, Q, R, u_min, u_max, state_constraints, maxiter):
+def _run_nmpc(kind, model, physics, T, y0, y_ref, control_dim,
+              N1, N2, Nu, Q, R, u_min, u_max, state_constraints, maxiter):
     """
-    Runs a single closed-loop NMPC simulation in its own process.
+    Runs a single closed-loop NMPC simulation, using `kind` to pick both
+    the predictive model and the controller architecture:
 
-    `kind` selects which predictive model drives the controller:
-      - "pinc" : the trained PINC net (`model`, already CPU-resident)
-      - "ode"  : a fresh RK4 predictive interface (cheaper substep count)
+      - "pinc"              : trained PINC net,  scipy/SLSQP single-shoot
+                               (the original NMPCController, via
+                               run_nmpc_simulation's own default)
+      - "ode"                : ODE/RK4 baseline,  scipy/SLSQP single-shoot
+      - "pinc_casadi_single" : trained PINC net,  CasADi/IPOPT single-shoot
+      - "pinc_casadi_multi"  : trained PINC net,  CasADi/IPOPT multiple-shoot
+      - "pinc_casadi_rti"    : trained PINC net,  CasADi RTI (single QP/step)
 
-    The plant (ground-truth RK4 integrator) and, for "ode", the
-    predictive interface itself are rebuilt here rather than passed in,
-    since the nested closures `rk4_control_interface` returns aren't
-    reliably picklable across a process boundary.
-
-    torch.set_num_threads(1) keeps each worker from spinning up its own
-    intra-op thread pool -- with tensors this small (batch size 1)
-    that overhead is pure contention on top of the process-level
-    parallelism, not useful compute.
+    The three "pinc_casadi_*" variants all reuse the exact same trained
+    `model.step` as the predictive model; only the *solver/architecture*
+    changes, which is the point of nmpc_casadi.py -- each one is a
+    drop-in for `NMPCController` via `run_nmpc_simulation`'s
+    `controller=` argument.
     """
-    torch.set_num_threads(1)
-
     plant = rk4_control_interface(physics, T, substeps=20)
-    control_interface = model.step if kind == "pinc" else rk4_control_interface(physics, T, substeps=5)
+
+    if kind == "pinc":
+        control_interface, controller, desc = model.step, None, "PINC (SLSQP)"
+    elif kind == "ode":
+        control_interface = rk4_control_interface(physics, T, substeps=5)
+        controller, desc = None, "ODE/RK (SLSQP)"
+    elif kind == "pinc_casadi_single":
+        control_interface = model.step
+        controller = CasadiSingleShootingNMPC(
+            model.step, control_dim, N1, N2, Nu, Q, R,
+            u_min=u_min, u_max=u_max, state_constraints=state_constraints)
+        desc = "PINC (IPOPT single-shoot)"
+    elif kind == "pinc_casadi_multi":
+        control_interface = model.step
+        controller = CasadiMultipleShootingNMPC(
+            model.step, control_dim, N1, N2, Nu, Q, R,
+            u_min=u_min, u_max=u_max, state_constraints=state_constraints)
+        desc = "PINC (IPOPT multi-shoot)"
+    elif kind == "pinc_casadi_rti":
+        control_interface = model.step
+        controller = CasadiRTIController(
+            model.step, control_dim, N1, N2, Nu, Q, R,
+            u_min=u_min, u_max=u_max, state_constraints=state_constraints)
+        desc = "PINC (RTI-QP)"
+    else:
+        raise ValueError(f"Unknown kind: {kind!r}")
 
     t0 = time.time()
     y, u = run_nmpc_simulation(
@@ -259,13 +288,16 @@ def _solve_nmpc_worker(kind, model, physics, T, y0, y_ref, control_dim,
         N1=N1, N2=N2, Nu=Nu, Q=Q, R=R, u_min=u_min, u_max=u_max,
         state_constraints=state_constraints,
         maxiter=maxiter, warm_start=True,
-        desc="PINC" if kind == "pinc" else "ODE/RK", position=0 if kind == "pinc" else 1,
+        controller=controller, desc=desc,
     )
     elapsed = time.time() - t0
     return y, u, elapsed
 
 
-def run_control_experiment(model, physics, T, n_steps=45):
+def run_control_experiment(model, physics, T, n_steps=45,
+                            architectures=("pinc", "ode",
+                                           "pinc_casadi_single",
+                                           "pinc_casadi_multi")):
     """Fig. 13/14, Table 1 style experiment: regulate h1, h2 to a step
     reference while keeping h3, h4 within [0.6, 5.5] cm.
 
@@ -290,9 +322,31 @@ def run_control_experiment(model, physics, T, n_steps=45):
     runtime; this only affects the internal prediction accuracy used
     for optimization, not the fidelity of the simulated closed loop.
 
-    NMPC solves go through scipy.optimize (CPU-only, numpy-backed), so
-    the model is moved to CPU here regardless of what device it was
-    trained on.
+    architectures : which controller(s) to run and compare, from
+        {"pinc", "ode", "pinc_casadi_single", "pinc_casadi_multi",
+        "pinc_casadi_rti"} -- see `_run_nmpc`. All share the same
+        plant, reference, and constraints, so results are directly
+        comparable; drop entries from the default tuple to skip them
+        (e.g. `architectures=("pinc", "pinc_casadi_multi")` for a quick
+        two-way comparison).
+
+        "pinc_casadi_rti" is deliberately left out of the default: the
+        four-tank orifice equation's sqrt(h) term has a steep, rapidly
+        varying local gradient, and RTI's single-linearization-per-step
+        approach re-uses that gradient across the whole prediction
+        horizon without ever re-deriving it from the true nonlinear
+        model mid-horizon. In testing this reliably drove the QP
+        infeasible partway through most timesteps (silently falling
+        back to a zero-increment control action -- see the fallback
+        in `CasadiRTIController.solve`), giving noticeably worse
+        constraint satisfaction than the other three. It works fine on
+        the gentler Van der Pol oscillator (`compare_nmpc_architectures.py`);
+        pass it explicitly here if you want to see the four-tank
+        failure mode for yourself.
+
+    The scipy-driven variants ("pinc", "ode") are CPU-only anyway, and
+    CasADi likewise runs on CPU here, so the model is moved to CPU
+    regardless of what device it was trained on.
     """
     model = model.to("cpu")
 
@@ -311,22 +365,16 @@ def run_control_experiment(model, physics, T, n_steps=45):
     u_min, u_max = [0.0, 0.0], [5.0, 5.0]
     state_constraints = [(2, 0.6, 5.5), (3, 0.6, 5.5)]
 
-    # The PINC-driven and ODE/RK-driven NMPC runs are fully independent
-    # (same plant, same reference, no shared mutable state), so run them
-    # in separate processes instead of back-to-back -- each one otherwise
-    # pins a single core for the whole simulation.
     common = dict(physics=physics, T=T, y0=y0, y_ref=y_ref, control_dim=2,
                   N1=N1, N2=N2, Nu=Nu, Q=Q, R=R, u_min=u_min, u_max=u_max,
                   state_constraints=state_constraints, maxiter=80)
 
-    y_pinc, u_pinc, t_pinc = _solve_nmpc_worker(kind="pinc", model=model, **common)
-
-    print("Running RK4 NMPC...")
-
-    y_ode, u_ode, t_ode = _solve_nmpc_worker(kind="ode",model=model, **common)
-
-    rmse_pinc, iae_pinc = integral_metrics(y_ref[:, :2], y_pinc[1:, :2])
-    rmse_ode, iae_ode = integral_metrics(y_ref[:, :2], y_ode[1:, :2])
+    results = {}
+    for kind in architectures:
+        print(f"Running {kind} NMPC...")
+        y, u, elapsed = _run_nmpc(kind=kind, model=model, **common)
+        rmse, iae = integral_metrics(y_ref[:, :2], y[1:, :2])
+        results[kind] = dict(y=y, u=u, elapsed=elapsed, rmse=rmse, iae=iae)
 
     def violation(y):
         h3, h4 = y[1:, 2], y[1:, 3]
@@ -335,39 +383,38 @@ def run_control_experiment(model, physics, T, n_steps=45):
         return (lo_viol + hi_viol).item()
 
     print("\nControl performance (four tanks, Table 1 style):")
-    print(f"{'Model':<10}{'RMSE':>10}{'IAE':>10}{'time(s)':>12}{'h3/h4 viol':>14}")
-    print(f"{'PINC':<10}{rmse_pinc:>10.3f}{iae_pinc:>10.2f}{t_pinc:>12.3f}{violation(y_pinc):>14.3f}")
-    print(f"{'ODE/RK':<10}{rmse_ode:>10.3f}{iae_ode:>10.2f}{t_ode:>12.3f}{violation(y_ode):>14.3f}")
+    print(f"{'Architecture':<26}{'RMSE':>10}{'IAE':>10}{'time(s)':>12}{'h3/h4 viol':>14}")
+    for kind, r in results.items():
+        print(f"{kind:<26}{r['rmse']:>10.3f}{r['iae']:>10.2f}{r['elapsed']:>12.3f}"
+              f"{violation(r['y']):>14.3f}")
 
     t_axis = torch.arange(n_steps + 1) * T
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
     fig, axes = plt.subplots(3, 1, figsize=(9, 9), sharex=True)
-    axes[0].plot(t_axis, y_pinc[:, 0], label="h1 (PINC)")
-    axes[0].plot(t_axis, y_pinc[:, 1], label="h2 (PINC)")
-    axes[0].plot(t_axis, y_ode[:, 0], "--", color="olive", label="h1 (ODE/RK)")
-    axes[0].plot(t_axis, y_ode[:, 1], "--", color="darkkhaki", label="h2 (ODE/RK)")
+    for i, (kind, r) in enumerate(results.items()):
+        y, u, color = r["y"], r["u"], colors[i % len(colors)]
+        axes[0].plot(t_axis, y[:, 0], color=color, label=f"h1 ({kind})")
+        axes[0].plot(t_axis, y[:, 1], "--", color=color, label=f"h2 ({kind})")
+        axes[1].plot(t_axis, y[:, 2], color=color, label=f"h3 ({kind})")
+        axes[1].plot(t_axis, y[:, 3], "--", color=color, label=f"h4 ({kind})")
+        axes[2].step(t_axis[:-1], u[:, 0], where="post", color=color, label=f"u1 ({kind})")
+        axes[2].step(t_axis[:-1], u[:, 1], where="post", linestyle="--", color=color, label=f"u2 ({kind})")
+
     axes[0].plot(t_axis, torch.cat([y_ref[:, 0], y_ref[-1:, 0]]), "k:", label="ref h1")
     axes[0].plot(t_axis, torch.cat([y_ref[:, 1], y_ref[-1:, 1]]), "k-.", label="ref h2")
     axes[0].set_ylabel("controlled levels")
-    axes[0].legend(fontsize=7, ncol=2)
+    axes[0].legend(fontsize=6, ncol=2)
     axes[0].set_title("NMPC control of the four-tank system")
 
-    axes[1].plot(t_axis, y_pinc[:, 2], label="h3 (PINC)")
-    axes[1].plot(t_axis, y_pinc[:, 3], label="h4 (PINC)")
-    axes[1].plot(t_axis, y_ode[:, 2], "--", color="olive", label="h3 (ODE/RK)")
-    axes[1].plot(t_axis, y_ode[:, 3], "--", color="darkkhaki", label="h4 (ODE/RK)")
     axes[1].axhline(0.6, color="grey", linestyle=":")
     axes[1].axhline(5.5, color="grey", linestyle=":")
     axes[1].set_ylabel("constrained levels")
-    axes[1].legend(fontsize=7, ncol=2)
+    axes[1].legend(fontsize=6, ncol=2)
 
-    axes[2].step(t_axis[:-1], u_pinc[:, 0], where="post", label="u1 (PINC)")
-    axes[2].step(t_axis[:-1], u_pinc[:, 1], where="post", label="u2 (PINC)")
-    axes[2].step(t_axis[:-1], u_ode[:, 0], where="post", linestyle="--", color="olive", label="u1 (ODE/RK)")
-    axes[2].step(t_axis[:-1], u_ode[:, 1], where="post", linestyle="--", color="darkkhaki", label="u2 (ODE/RK)")
     axes[2].set_ylabel("pump voltage")
     axes[2].set_xlabel("Time (s)")
-    axes[2].legend(fontsize=7, ncol=2)
+    axes[2].legend(fontsize=6, ncol=2)
 
     plt.tight_layout()
     plt.savefig("fourtank_nmpc_control.png", dpi=150)

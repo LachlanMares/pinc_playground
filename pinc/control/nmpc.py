@@ -203,7 +203,8 @@ def run_nmpc_simulation(control_interface, plant_step, y0, y_ref_full,
                          control_dim, N1, N2, Nu, Q, R,
                          u_min=None, u_max=None, state_constraints=None,
                          maxiter=30, warm_start=True,
-                         desc=None, position=None, leave=True):
+                         desc=None, position=None, leave=True,
+                         controller=None):
     """
     Implements Algorithm 2: for each timestep k, solve the NMPC problem
     using `control_interface` as predictive model, apply the resulting
@@ -228,11 +229,26 @@ def run_nmpc_simulation(control_interface, plant_step, y0, y_ref_full,
                  worker process) can give each its own labeled line
                  (`position=0`, `position=1`, ...) instead of every bar
                  fighting over the same terminal line.
+
+    controller : optional, a pre-built controller object exposing the
+                 same `.solve(y_current, u_prev, y_ref_horizon,
+                 du_init=None) -> (u_apply, du_opt)` interface as
+                 `NMPCController` -- e.g. any of `CasadiSingleShootingNMPC`,
+                 `CasadiMultipleShootingNMPC`, or `CasadiRTIController`
+                 from `nmpc_casadi.py`. When given, all the NMPC-solver
+                 keyword args above (`control_interface`, `N1`, `N2`,
+                 `Nu`, `Q`, `R`, `u_min`, `u_max`, `state_constraints`,
+                 `maxiter`) are ignored in favor of however `controller`
+                 was already configured; only `plant_step`, `y0`,
+                 `y_ref_full`, `control_dim`, and `warm_start` still
+                 apply. This is what lets the exact same simulation
+                 loop drive any NMPC architecture interchangeably.
     """
-    controller = NMPCController(control_interface, control_dim, N1, N2, Nu, Q, R,
-                                 u_min=u_min, u_max=u_max,
-                                 state_constraints=state_constraints,
-                                 maxiter=maxiter)
+    if controller is None:
+        controller = NMPCController(control_interface, control_dim, N1, N2, Nu, Q, R,
+                                     u_min=u_min, u_max=u_max,
+                                     state_constraints=state_constraints,
+                                     maxiter=maxiter)
 
     C = y_ref_full.shape[0]
     y = y0.clone()
