@@ -70,7 +70,7 @@ def build_easy_validation_trajectory(physics: CartPole, T, n_steps=20, u_const=0
     return y0, u_seq, y_true
 
 
-def train_pinc(physics: CartPole, T, k1_epochs=500, k2_iters=2000, hidden=64, depth=4,
+def train_pinc(physics: CartPole, T, k1_epochs=500, k2_iters=2000, hidden=128, depth=3,
                n_boundary=4000, n_collocation=100000,
                n_multistep=4000, multistep_k=3, lambda_phys=1.0,
                device="cpu", checkpoint_path=None, resume=False, save_every=100):
