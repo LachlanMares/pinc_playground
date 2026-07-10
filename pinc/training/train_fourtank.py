@@ -139,7 +139,7 @@ def plot_training_curves(history):
     plt.legend()
     plt.grid(True, which="both", alpha=0.3)
     plt.tight_layout()
-    plt.savefig("fourtank_training_curves.png", dpi=150)
+    plt.savefig("plots/ode/fourtank_training_curves.png", dpi=150)
     plt.close()
 
 
@@ -163,13 +163,13 @@ def plot_long_range_prediction(model, physics, T):
         model, physics, T,
         *build_validation_trajectory(physics, T, n_steps=35, seed=1),
         title="PINC self-loop vs true (random control signal)",
-        out_path="fourtank_long_range_prediction.png",
+        out_path="plots/ode/fourtank_long_range_prediction.png",
     )
     _plot_rollout_diagnostic(
         model, physics, T,
         *build_easy_validation_trajectory(physics, T, n_steps=35, u_const=2.5),
         title="PINC self-loop vs true (constant u1=u2=2.5)",
-        out_path="fourtank_long_range_prediction_easy.png",
+        out_path="plots/ode/fourtank_long_range_prediction_easy.png",
     )
 
 
@@ -417,7 +417,7 @@ def run_control_experiment(model, physics, T, n_steps=45,
     axes[2].legend(fontsize=6, ncol=2)
 
     plt.tight_layout()
-    plt.savefig("fourtank_nmpc_control.png", dpi=150)
+    plt.savefig("plots/ode/fourtank_nmpc_control.png", dpi=150)
     plt.close()
 
 

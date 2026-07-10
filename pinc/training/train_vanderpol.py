@@ -150,7 +150,7 @@ def plot_training_curves(history):
     plt.legend()
     plt.grid(True, which="both", alpha=0.3)
     plt.tight_layout()
-    plt.savefig("vanderpol_training_curves.png", dpi=150)
+    plt.savefig("plots/ode/vanderpol_training_curves.png", dpi=150)
     plt.close()
 
 
@@ -159,13 +159,13 @@ def plot_long_range_prediction(model, physics, T):
         model, physics, T,
         *build_validation_trajectory(physics, T, n_steps=20, seed=1),
         title="PINC self-loop vs true (random-switching input)",
-        out_path="vanderpol_long_range_prediction.png",
+        out_path="plots/ode/vanderpol_long_range_prediction.png",
     )
     _plot_rollout_diagnostic(
         model, physics, T,
         *build_easy_validation_trajectory(physics, T, n_steps=20, u_const=0.0),
         title="PINC self-loop vs true (constant u=0, unforced)",
-        out_path="vanderpol_long_range_prediction_easy.png",
+        out_path="plots/ode/vanderpol_long_range_prediction_easy.png",
     )
 
 
@@ -361,7 +361,7 @@ def run_control_experiment(model, physics, T, n_steps=120):
     axes[1].legend(fontsize=8)
 
     plt.tight_layout()
-    plt.savefig("vanderpol_nmpc_control.png", dpi=150)
+    plt.savefig("plots/ode/vanderpol_nmpc_control.png", dpi=150)
     plt.close()
 
 
