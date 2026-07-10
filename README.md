@@ -156,6 +156,48 @@ approximation.
   `PINCTransientPDE`-compatible finite-difference ground truth should
   slot in the same way the incompressible case did here.
 
+### CasADi-based MPC for the PDE-PINC net
+
+Mirroring `nmpc_casadi.py` / `casadi_backend.py` on the ODE side, the
+PDE-PINC's transient net can also be driven by IPOPT (or a linearized
+QP) instead of scipy's SLSQP:
+
+| File | Role |
+|---|---|
+| `pinc/control/casadi_backend_pde.py` | Rebuilds `PINCTransientPDE`'s backbone symbolically in CasADi (`pinc_transient_step_to_casadi`), given a fixed measurement position `x_bar` |
+| `pinc/control/nmpc_pde_casadi.py` | `CasadiPDEMPC` (IPOPT, single shooting) and `CasadiPDERTIController` (linearized QP, one solve per step) |
+| `pinc/training/compare_nmpc_pde_architectures.py` | Runs all three (SLSQP, IPOPT, RTI-QP) on the same tracking task and plots them together |
+
+Both new controllers are drop-in replacements for `PDEMPCController`
+(same `.solve(u0, y0_true, u_init=None) -> (u_apply, u_dec_opt)`
+interface) and can be passed to `run_pde_mpc_simulation`'s `controller=`
+argument, exactly as `CasadiSingleShootingNMPC` etc. can be passed to
+`run_nmpc_simulation` on the ODE side.
+
+**No multiple-shooting variant** exists for the PDE-MPC, and this is a
+deliberate omission rather than a missing feature: multiple shooting
+earns its keep by decoupling a genuinely *nonlinear state* from the
+controls so the solver can move each independently. Here there is no
+nonlinear state at all -- the only thing "carried forward" between
+prediction steps is the previous stage's control itself (an identity
+map, see `nmpc_pde.py`'s module docstring), which is already a free
+decision variable in the single-shooting formulation. Adding shooting
+nodes for an identity recursion would only add decision variables and
+equality constraints for something IPOPT already sees exactly as-is.
+
+Run with:
+
+```bash
+python -m pinc.training.compare_nmpc_pde_architectures
+```
+
+(trains a fresh PINC-SteadyState/Transient pair itself, since
+`train_incompressible_pde.py` doesn't checkpoint to disk; pass
+`--k1`/`--k2` to trade training time for prediction accuracy -- as
+with the plain MPC demo, an undertrained transient net gives the
+controller too little gradient signal to do useful work, independent
+of which solver architecture is driving it).
+
 ### Extending further
 
 - **Compressible/gas flow**: add `pinc/physics/pde_compressible_flow.py`

@@ -158,7 +158,7 @@ class PDEMPCController:
 def run_pde_mpc_simulation(transient_model, plant_step, physics, x_bar, target,
                             u0_init, n_steps, Np, Nc, lambda_smooth=0.1,
                             dy_max=None, u_min=0.0, u_max=1.0, maxiter=50,
-                            warm_start=True, desc="PDE-MPC"):
+                            warm_start=True, desc="PDE-MPC", controller=None):
     """
     Implements Algorithm 2 (Sec. 4.5.1): at every step, solve the MPC
     problem given the last *applied* control u0, apply the resulting u1
@@ -171,11 +171,24 @@ def run_pde_mpc_simulation(transient_model, plant_step, physics, x_bar, target,
                  -- takes (V_batch, u_batch) -> V_next_batch (normalized
                  velocity), one window (tref seconds) ahead.
 
+    controller : optional, a pre-built controller exposing the same
+                 `.solve(u0, y0_true, u_init=None) -> (u_apply, u_dec_opt)`
+                 interface as `PDEMPCController` -- e.g. `CasadiPDEMPC`
+                 or `CasadiPDERTIController` from `nmpc_pde_casadi.py`.
+                 When given, `transient_model`, `Np`, `Nc`,
+                 `lambda_smooth`, `dy_max`, `u_min`, `u_max`, `maxiter`
+                 are ignored in favor of however `controller` was
+                 already configured; only `plant_step`, `physics`,
+                 `x_bar`, `target`, `u0_init`, `n_steps`, and `desc`
+                 still apply. Mirrors `run_nmpc_simulation`'s
+                 `controller=` argument on the ODE-PINC side.
+
     returns (V_hist, P_hist, u_hist): (n_steps+1,), (n_steps+1,), (n_steps,)
     """
-    controller = PDEMPCController(transient_model, x_bar, target, Np, Nc,
-                                   lambda_smooth=lambda_smooth, dy_max=dy_max,
-                                   u_min=u_min, u_max=u_max, maxiter=maxiter)
+    if controller is None:
+        controller = PDEMPCController(transient_model, x_bar, target, Np, Nc,
+                                       lambda_smooth=lambda_smooth, dy_max=dy_max,
+                                       u_min=u_min, u_max=u_max, maxiter=maxiter)
 
     u0 = torch.tensor(u0_init, dtype=torch.float32)
     # true initial velocity consistent with steady state under u0_init

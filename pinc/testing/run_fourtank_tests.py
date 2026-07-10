@@ -13,14 +13,14 @@ Runs a battery of varied tests against a trained four-tank PINC checkpoint:
 
 Usage (from the repo root, i.e. the directory containing `pinc/`):
 
-    python -m pinc.testing.run_fourtank_tests
-    python -m pinc.testing.run_fourtank_tests --list
-    python -m pinc.testing.run_fourtank_tests --rollout-only
-    python -m pinc.testing.run_fourtank_tests --nmpc-only --skip-ode-baseline
-    python -m pinc.testing.run_fourtank_tests --scenarios nominal_random,bang_bang_control
-    python -m pinc.testing.run_fourtank_tests --quick
-    python -m pinc.testing.run_fourtank_tests --nmpc-only --architectures pinc,pinc_casadi_multi
-    python -m pinc.testing.run_fourtank_tests --nmpc-only --architectures pinc_casadi_rti
+    python3 -m pinc.testing.run_fourtank_tests
+    python3 -m pinc.testing.run_fourtank_tests --list
+    python3 -m pinc.testing.run_fourtank_tests --rollout-only
+    python3 -m pinc.testing.run_fourtank_tests --nmpc-only --skip-ode-baseline
+    python3 -m pinc.testing.run_fourtank_tests --scenarios nominal_random,bang_bang_control
+    python3 -m pinc.testing.run_fourtank_tests --quick
+    python3 -m pinc.testing.run_fourtank_tests --nmpc-only --architectures pinc,pinc_casadi_multi
+    python3 -m pinc.testing.run_fourtank_tests --nmpc-only --architectures pinc_casadi_rti
 
 See --help for the full option list. Results (CSVs, per-scenario plots,
 and a markdown summary report) are written to --out-dir (default
