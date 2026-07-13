@@ -33,8 +33,8 @@ from pinc.models.pinc_cartpole import CartPolePINCModel, load_cartpole_pinc_mode
 from pinc.core.trainer import Trainer
 from pinc.losses.pinc_loss import PINCLoss
 from pinc.datasets.cartpole import (make_cartpole_sampler, random_control_signal,
-                                     generate_swingup_reference)
-from pinc.evaluation.rollout import pinc_rollout, mse_gen
+                                     generate_swingup_reference, cartpole_state_weights)
+from pinc.evaluation.rollout import pinc_rollout
 from pinc.simulation.rk4 import simulate, rk4_control_interface
 from pinc.control.nmpc import run_nmpc_simulation
 from pinc.visualization.cartpole_animation import animate_cartpole
@@ -72,7 +72,7 @@ def build_easy_validation_trajectory(physics: CartPole, T, n_steps=20, u_const=0
 
 def train_pinc(physics: CartPole, T, k1_epochs=500, k2_iters=2000, hidden=64, depth=4,
                n_boundary=4000, n_collocation=100000,
-               n_multistep=4000, multistep_k=3, lambda_phys=1.0,
+               n_multistep=4000, multistep_k=15, lambda_phys=1.0,
                device="cpu", checkpoint_path=None, resume=False, save_every=100):
     """
     Same shape as `train_vanderpol.train_pinc`; the only cart-pole-
@@ -83,6 +83,18 @@ def train_pinc(physics: CartPole, T, k1_epochs=500, k2_iters=2000, hidden=64, de
     strongly nonlinear sin/cos coupling terms, and a much larger
     excursion range for a genuine swing-up), so it benefits from more
     network capacity than the 2-state oscillator does.
+
+    multistep_k=15 (~0.3s of chained self-loop steps at T=0.02s) rather
+    than a shorter default: an earlier run with multistep_k=3 (~0.06s)
+    showed the trained model's endpoint/physics losses converging
+    reasonably while a long-horizon self-loop rollout (the actual use
+    pattern for NMPC/animation) visibly drifted from RK4 starting
+    around 0.3-0.4s in -- i.e. the training signal wasn't looking far
+    enough ahead to penalize exactly the failure mode that showed up
+    downstream. If this is still too short for your own diagnostics,
+    it's cheap to raise further (cost scales with n_multistep *
+    multistep_k RK4-vs-network step comparisons per epoch, not with
+    the full collocation cost).
     """
     meta = {
         "state_dim": physics.state_dim,
@@ -99,12 +111,22 @@ def train_pinc(physics: CartPole, T, k1_epochs=500, k2_iters=2000, hidden=64, de
 
     sampler = make_cartpole_sampler(physics, T, device=device)
     loss_fn = PINCLoss(physics, T=T, lambda_phys=lambda_phys,
-                        lambda_endpoint=1.0, lambda_multistep=1.0)
+                        lambda_endpoint=1.0, lambda_multistep=1.0,
+                        state_weights=cartpole_state_weights())
 
     y0_val, u_val, y_true_val = build_validation_trajectory(physics, T)
+    _val_weights = cartpole_state_weights()
 
     def validate_fn(m):
-        return mse_gen(m, y0_val, u_val, y_true_val)
+        # Weighted the same way as the training loss (see PINCLoss's
+        # `state_weights` docstring) rather than plain `mse_gen` --
+        # otherwise best-checkpoint selection would keep favoring
+        # whichever checkpoint fits theta/theta_dot best even after
+        # the training objective itself has been rebalanced, since an
+        # unweighted metric has the exact same small-channel-gets-
+        # ignored bias the loss fix was meant to address.
+        y_pred = pinc_rollout(m, y0_val, u_val)
+        return torch.mean(((y_pred - y_true_val) * _val_weights) ** 2).item()
 
     trainer = Trainer(model, sampler, loss_fn,
                        n_boundary=n_boundary, n_collocation=n_collocation,
@@ -187,16 +209,31 @@ def integral_metrics(y_ref, y):
 
 
 def _solve_nmpc_worker(kind, model, physics, T, y0, y_ref, control_dim,
-                        N1, N2, Nu, Q, R, u_min, u_max, maxiter):
+                        N1, N2, Nu, Q, R, u_min, u_max, maxiter,
+                        plant_substeps=20, predict_substeps=20):
     """Same structure as `train_vanderpol._solve_nmpc_worker`: `kind`
     selects whether the trained PINC net or a fresh RK4 predictive
     interface drives the NMPC controller; the plant (ground truth) is
-    always RK4."""
+    always RK4.
+
+    `predict_substeps` only affects the "ode" kind's *internal*
+    predictive model (the one NMPC's optimizer calls N2 times per
+    solve, every control step) -- it's independent of `plant_substeps`
+    (the ground-truth plant integration, kept accurate). This is the
+    knob to turn down if the RK4/ODE NMPC baseline is too slow: each
+    SLSQP iteration re-integrates the predictive rollout from scratch,
+    so its cost scales directly with `predict_substeps`, and a shorter
+    N2-step lookahead generally doesn't need the same integration
+    accuracy the ground-truth plant does. The PINC-driven run is
+    unaffected either way -- `model.step` is a single MLP forward
+    pass, not an RK4 integration, which is the whole reason it's
+    orders of magnitude faster here.
+    """
     if kind == "pinc":
         control_interface = model.step
     else:
-        control_interface = rk4_control_interface(physics, T, substeps=20)
-    plant = rk4_control_interface(physics, T, substeps=20)
+        control_interface = rk4_control_interface(physics, T, substeps=predict_substeps)
+    plant = rk4_control_interface(physics, T, substeps=plant_substeps)
 
     t0 = time.time()
     y, u = run_nmpc_simulation(
@@ -211,16 +248,13 @@ def _solve_nmpc_worker(kind, model, physics, T, y0, y_ref, control_dim,
     return y, u, elapsed
 
 
-def run_control_experiment(model, physics, T, N_ref=250):
-    """
-    Generates the swing-up reference trajectory, then runs closed-loop
-    NMPC tracking it with both the PINC net and the RK4/ODE baseline as
-    predictive model (reusing `NMPCController`/`run_nmpc_simulation`
-    completely unmodified, exactly as `nmpc_pde.py`'s module docstring
-    notes is possible for the ODE case).
-    """
-    model = model.to("cpu")
-
+def build_reference_and_nmpc_config(physics, T, N_ref=250):
+    """Everything both tracking runs need to share (same reference
+    trajectory, same cost/horizon/constraint setup), split out so
+    `run_pinc_tracking`/`run_ode_tracking` can each be called
+    independently -- and, in particular, so the PINC run's results can
+    be saved/animated before the (dramatically slower) RK4 baseline is
+    even started, rather than only after both finish."""
     print("Solving offline swing-up reference trajectory...")
     u_ref, y_ref = generate_swingup_reference(physics, T, N=N_ref)
 
@@ -229,29 +263,27 @@ def run_control_experiment(model, physics, T, N_ref=250):
     Q = torch.diag(torch.tensor([2.0, 1.0, 40.0, 4.0]))
     R = torch.diag(torch.tensor([0.01]))
 
-    N1, N2, Nu = 1, 20, 10
-    u_min, u_max = [-15.0], [15.0]
-
     common = dict(physics=physics, T=T, y0=y0, y_ref=y_ref[1:], control_dim=1,
-                  N1=N1, N2=N2, Nu=Nu, Q=Q, R=R, u_min=u_min, u_max=u_max,
+                  N1=1, N2=20, Nu=10, Q=Q, R=R, u_min=[-15.0], u_max=[15.0],
                   maxiter=30)
+    return y_ref, u_ref, common
 
+
+def run_pinc_tracking(model, common):
     print("Running PINC NMPC (tracking the swing-up reference)...")
-    y_pinc, u_pinc, t_pinc = _solve_nmpc_worker("pinc", model, **common)
+    return _solve_nmpc_worker("pinc", model, **common)
 
-    print("Running RK4 NMPC (tracking the swing-up reference)...")
-    y_ode, u_ode, t_ode = _solve_nmpc_worker("ode", model, **common)
 
-    rmse_pinc, iae_pinc = integral_metrics(y_ref[1:], y_pinc[1:])
-    rmse_ode, iae_ode = integral_metrics(y_ref[1:], y_ode[1:])
+def run_ode_tracking(common, predict_substeps=20):
+    print("Running RK4 NMPC (tracking the swing-up reference)... "
+          "(this is the slow one: every SLSQP iteration re-integrates "
+          "the predictive rollout with real RK4, not a cheap MLP pass)")
+    return _solve_nmpc_worker("ode", None, predict_substeps=predict_substeps, **common)
 
-    print("\nControl performance (cart-pole swing-up, reference-tracking NMPC):")
-    print(f"{'Model':<10}{'RMSE':>10}{'IAE':>10}{'time(s)':>12}")
-    print(f"{'PINC':<10}{rmse_pinc:>10.3f}{iae_pinc:>10.2f}{t_pinc:>12.3f}")
-    print(f"{'ODE/RK':<10}{rmse_ode:>10.3f}{iae_ode:>10.2f}{t_ode:>12.3f}")
 
+def plot_control_comparison(y_ref, y_pinc, u_pinc, y_ode, u_ode, T, N_ref,
+                             out_path="plots/cartpole/cartpole_nmpc_control.png"):
     t_axis = torch.arange(N_ref + 1) * T
-
     labels = ["x (m)", "x_dot (m/s)", "theta (rad)", "theta_dot (rad/s)"]
     fig, axes = plt.subplots(5, 1, figsize=(9, 13), sharex=True)
     for i in range(4):
@@ -269,10 +301,8 @@ def run_control_experiment(model, physics, T, N_ref=250):
     axes[4].legend(fontsize=8)
 
     plt.tight_layout()
-    plt.savefig("plots/cartpole/cartpole_nmpc_control.png", dpi=150)
+    plt.savefig(out_path, dpi=150)
     plt.close()
-
-    return y_pinc, u_pinc, y_ref, u_ref
 
 
 def main():
@@ -294,6 +324,19 @@ def main():
     parser.add_argument("--k2", type=int, default=2000, help="number of L-BFGS iterations")
     parser.add_argument("--no-animation", action="store_true",
                          help="skip generating the cartpole_swingup.gif animation")
+    parser.add_argument("--skip-rk4-baseline", action="store_true",
+                         help="skip the RK4/ODE NMPC baseline entirely -- it's orders of "
+                              "magnitude slower than the PINC-driven run (every SLSQP "
+                              "iteration re-integrates the predictive rollout with real RK4 "
+                              "instead of one cheap MLP forward pass), and isn't needed for "
+                              "the PINC results, plots, or animation, only for the "
+                              "PINC-vs-ODE comparison plot")
+    parser.add_argument("--rk4-predict-substeps", type=int, default=20,
+                         help="RK4 substeps used *inside* the ODE/RK4 NMPC baseline's own "
+                              "predictive rollout (not the ground-truth plant, which stays "
+                              "accurate regardless). Lowering this (e.g. to 4) is the main "
+                              "lever for speeding up --skip-rk4-baseline=False runs, at the "
+                              "cost of a somewhat less accurate lookahead for that baseline")
     args = parser.parse_args()
 
     physics = CartPole(M=1.0, m=0.1, L=1.0, g=9.8)
@@ -314,17 +357,44 @@ def main():
     if history is not None:
         plot_training_curves(history)
     plot_long_range_prediction(model, physics, T)
-    y_pinc, u_pinc, y_ref, u_ref = run_control_experiment(model, physics, T)
+
+    model = model.to("cpu")
+    N_ref = 250
+    y_ref, u_ref, common = build_reference_and_nmpc_config(physics, T, N_ref=N_ref)
+
+    # ---- PINC NMPC: run, save, and animate immediately -- this is the
+    # fast run (a few seconds to ~1min total), so there's no reason to
+    # make it wait on the much slower RK4 baseline below. ----
+    y_pinc, u_pinc, t_pinc = run_pinc_tracking(model, common)
+    rmse_pinc, iae_pinc = integral_metrics(y_ref[1:], y_pinc[1:])
+    print(f"\nPINC NMPC: RMSE={rmse_pinc:.3f}  IAE={iae_pinc:.2f}  time={t_pinc:.3f}s")
 
     print("\nSaved figures: cartpole_training_curves.png, "
-          "cartpole_long_range_prediction.png, cartpole_long_range_prediction_easy.png, "
-          "cartpole_nmpc_control.png")
+          "cartpole_long_range_prediction.png, cartpole_long_range_prediction_easy.png")
 
     if not args.no_animation:
         animate_cartpole(y_pinc, u_pinc, T, physics,
-                          out_path="cartpole_swingup.gif",
+                          out_path="plots/cartpole/cartpole_swingup.gif",
                           title="Cart-pole swing-up -- PINC-driven NMPC")
         print("Saved animation: cartpole_swingup.gif")
+
+    # ---- RK4/ODE NMPC baseline: slow (real RK4 integration inside every
+    # optimizer iteration, not a cheap MLP pass) -- optional, and only
+    # needed for the comparison plot below. ----
+    if args.skip_rk4_baseline:
+        print("\n--skip-rk4-baseline set: skipping the ODE/RK NMPC comparison run.")
+        return
+
+    y_ode, u_ode, t_ode = run_ode_tracking(common, predict_substeps=args.rk4_predict_substeps)
+    rmse_ode, iae_ode = integral_metrics(y_ref[1:], y_ode[1:])
+
+    print("\nControl performance (cart-pole swing-up, reference-tracking NMPC):")
+    print(f"{'Model':<10}{'RMSE':>10}{'IAE':>10}{'time(s)':>12}")
+    print(f"{'PINC':<10}{rmse_pinc:>10.3f}{iae_pinc:>10.2f}{t_pinc:>12.3f}")
+    print(f"{'ODE/RK':<10}{rmse_ode:>10.3f}{iae_ode:>10.2f}{t_ode:>12.3f}")
+
+    plot_control_comparison(y_ref, y_pinc, u_pinc, y_ode, u_ode, T, N_ref)
+    print("Saved figure: cartpole_nmpc_control.png")
 
 
 if __name__ == "__main__":

@@ -5,41 +5,78 @@ from scipy.optimize import minimize
 from pinc.datasets.pinc_dataset import PINCSampler
 from pinc.simulation.rk4 import rk4_step
 
+# Single source of truth for the cart-pole state domain -- used both by
+# `make_cartpole_sampler` (as the actual sampling box) and by
+# `cartpole_state_weights` (to derive per-channel loss weights from the
+# same characteristic scales), so the two can't silently drift apart.
+#
+# NOTE: tightened after an initial training run showed the physics-
+# residual loss plateauing well above the data/endpoint losses, with
+# visible open-loop self-loop drift even in the u=0 free-response case
+# -- the original +/-2*pi / +/-10 / +/-6 box was wide enough that the
+# network's capacity/training budget was mostly being spent fitting a
+# residual across huge swaths of state space the actual swing-up
+# trajectory never visits, diluting effective sample density where it
+# mattered. These ranges are still generous relative to the verified
+# reference trajectory (theta in [~0.25, ~4.85] rad, |x| < 0.65m -- see
+# `generate_swingup_reference`'s docstring/verification), but no longer
+# span a near-full revolution of slack on every side.
+#
+# x, x_dot   : +/- 1.5m / +/- 4 m/s -- still headroom beyond the
+#              reference's observed |x| < 0.65m (e.g. for NMPC tracking
+#              error to push the plant somewhat off the reference),
+#              just not the original +/-3 / +/-6.
+# theta      : (-1.0, 2*pi + 0.5) rad -- covers hanging-start (pi)
+#              through a full swing-up-and-slightly-past (~2*pi), plus
+#              a bit of negative-side margin in case a correcting
+#              controller overshoots past upright the other way. theta
+#              is never wrapped anywhere in this codebase (see
+#              `CartPole`'s docstring), and the sin/cos encoding in
+#              `CartPolePINCModel` resolves the resulting periodicity
+#              ambiguity by having the network predict a *delta* rather
+#              than an absolute angle -- this range only needs to cover
+#              states actually visited, not exactly one period.
+# theta_dot  : +/- 8 rad/s -- swing-up passes through fairly fast
+#              intermediate angular velocities (energy-pumping motion),
+#              so this still needs real headroom, just less than the
+#              original +/-10.
+CARTPOLE_Y_RANGE = [(-1.5, 1.5), (-4.0, 4.0), (-1.0, 2 * np.pi + 0.5), (-8.0, 8.0)]
+# u (force): +/- 15 N -- this is the actuator limit itself (matches
+# `generate_swingup_reference`'s `u_max`), not a domain-coverage
+# question, so it isn't part of the same "tighten to what's visited"
+# reasoning as the state ranges above.
+CARTPOLE_U_RANGE = [(-15.0, 15.0)]
+
+
+def cartpole_state_weights():
+    """
+    Per-channel weights for `PINCLoss(..., state_weights=...)`, derived
+    from `CARTPOLE_Y_RANGE`'s half-widths (1 / half-width, so a given
+    *relative* error -- e.g. "off by 10% of this channel's typical
+    range" -- costs the same in the loss regardless of which channel
+    it's in).
+
+    Why this matters here specifically: `theta` naturally ranges over
+    several radians while `x_dot` naturally ranges over a few tenths of
+    a m/s -- in an *unweighted* MSE across all four channels combined
+    (the base `PINCLoss` behavior), theta's errors are numerically much
+    larger and dominate the gradient, so the optimizer has little
+    incentive to fix x/x_dot even when they're relatively very wrong.
+    That's exactly the failure mode a training run showed: theta/
+    theta_dot tracked a validation rollout reasonably well while x/x_dot
+    drifted badly (and inconsistently with their own predicted
+    derivative) in the self-loop diagnostics. Weighting by inverse
+    range restores balance across channels.
+    """
+    half_widths = torch.tensor([(hi - lo) / 2.0 for lo, hi in CARTPOLE_Y_RANGE])
+    return 1.0 / half_widths
+
 
 def make_cartpole_sampler(physics, T, device="cpu"):
-    """
-    Sampling ranges for the cart-pole swing-up task.
-
-    x, x_dot   : generous cart-travel/velocity range -- a swing-up
-                 maneuver typically needs the cart to move back and
-                 forth by O(1) m to pump energy into the pole, so the
-                 box needs real headroom rather than the tight
-                 near-zero range a *balance-only* task could get away
-                 with.
-    theta      : +/- 2*pi (a bit more than one full revolution either
-                 side of upright). theta is never wrapped anywhere in
-                 this codebase (see `CartPole`'s docstring), and the
-                 sin/cos encoding in `CartPolePINCModel` resolves the
-                 resulting periodicity ambiguity by having the network
-                 predict a *delta* rather than an absolute angle (see
-                 that class's docstring) -- so this range only needs
-                 to be "wide enough to cover states actually visited
-                 during training/control", not "exactly one period".
-                 The reference swing-up trajectory generated by
-                 `generate_swingup_reference` below stays well inside
-                 this range (starts at pi, ends near 0, peaks under
-                 ~5 rad in between for the default cost weights).
-    theta_dot  : swing-up passes through fairly fast intermediate
-                 angular velocities (energy-pumping motion), so this
-                 needs more headroom than a small-angle-only setup.
-    u (force)  : +/- 15 N -- enough authority to swing this (fairly
-                 light, M=1.0/m=0.1/L=1.0 kg-m default) pole up in a
-                 few seconds without needing an unrealistically large
-                 actuator.
-    """
-    y_range = [(-3.0, 3.0), (-6.0, 6.0), (-2 * np.pi, 2 * np.pi), (-10.0, 10.0)]
-    u_range = [(-15.0, 15.0)]
-    return PINCSampler(physics, T=T, y_range=y_range, u_range=u_range, device=device)
+    """Sampling ranges for the cart-pole swing-up task -- see
+    `CARTPOLE_Y_RANGE`/`CARTPOLE_U_RANGE` above for the reasoning behind
+    each bound."""
+    return PINCSampler(physics, T=T, y_range=CARTPOLE_Y_RANGE, u_range=CARTPOLE_U_RANGE, device=device)
 
 
 def random_control_signal(n_steps, control_dim=1, u_range=(-15.0, 15.0), hold=1, seed=None):

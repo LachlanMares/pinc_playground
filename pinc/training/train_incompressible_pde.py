@@ -55,7 +55,7 @@ _VAL_US = [0.15, 0.35, 0.55, 0.75, 0.90]  # controls used for steady-state valid
 # ----------------------------------------------------------------------
 # Steady-state stage
 # ----------------------------------------------------------------------
-def train_steady_state(physics, hidden=20, depth=4, k1_epochs=300, k2_iters=300,
+def train_steady_state(physics, hidden=32, depth=3, k1_epochs=300, k2_iters=300,
                         n_collocation=1000, n_boundary=200, device="cpu",
                         checkpoint_path=None, resume=False, save_every=100):
     """
@@ -91,7 +91,7 @@ def train_steady_state(physics, hidden=20, depth=4, k1_epochs=300, k2_iters=300,
     return trainer.model, history
 
 
-def plot_steady_state_profiles(model, physics, out_path="incompressible_pde_steady_state.png"):
+def plot_steady_state_profiles(model, physics, out_path="plots/pde/incompressible_pde_steady_state.png"):
     """Fig. 8 style: PINC-SS vs. exact analytic steady-state profile for
     several control values."""
     us = _VAL_US
@@ -143,7 +143,7 @@ def _steady_state_mape(model, physics, us, x):
 # ----------------------------------------------------------------------
 # Transient stage
 # ----------------------------------------------------------------------
-def train_transient(physics, steady_state_model, hidden=20, depth=4,
+def train_transient(physics, steady_state_model, hidden=32, depth=3,
                      k1_epochs=400, k2_iters=400,
                      n_collocation=4000, n_boundary=1000, n_ic=1000, device="cpu",
                      checkpoint_path=None, resume=False, save_every=100, x_bar=0.1):
@@ -228,7 +228,7 @@ def _open_loop_mse(transient_model, physics, x_bar=0.1):
 
 
 def plot_open_loop_forward_simulation(transient_model, physics, x_bar=0.1,
-                                       out_path="incompressible_pde_transient_openloop.png"):
+                                       out_path="plots/pde/incompressible_pde_transient_openloop.png"):
     """Fig. 10 style plot of `_open_loop_forward_simulation`'s result."""
     t_axis, u_windows, P_true, P_pinc = _open_loop_forward_simulation(transient_model, physics, x_bar=x_bar)
 
@@ -252,7 +252,7 @@ def plot_open_loop_forward_simulation(transient_model, physics, x_bar=0.1,
 # MPC control stage
 # ----------------------------------------------------------------------
 def run_mpc_demo(transient_model, physics, x_bar=0.1, n_steps=30,
-                  out_path="incompressible_pde_mpc_control.png"):
+                  out_path="plots/pde/incompressible_pde_mpc_control.png"):
     """Fig. 11 style: drive the PDG pressure down towards an unattainable
     (production-maximizing) target, subject to a rate constraint."""
     plant = IncompressiblePipePlant(physics)
@@ -292,8 +292,8 @@ def run_mpc_demo(transient_model, physics, x_bar=0.1, n_steps=30,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--k1", type=int, default=800, help="ADAM epochs (both stages)")
-    parser.add_argument("--k2", type=int, default=400, help="L-BFGS iters (both stages)")
+    parser.add_argument("--k1", type=int, default=25000, help="ADAM epochs (both stages)")
+    parser.add_argument("--k2", type=int, default=2500, help="L-BFGS iters (both stages)")
     parser.add_argument("--checkpoint-steady-state", default="checkpoints/pde_steady_state.pt",
                          help="path to save/load the steady-state training checkpoint")
     parser.add_argument("--checkpoint-transient", default="checkpoints/pde_transient.pt",
@@ -338,12 +338,12 @@ def main():
 
     if ss_history is not None:
         plot_training_curves(ss_history, "PDE-PINC steady-state training",
-                              "incompressible_pde_steady_state_training.png")
+                              "plots/pde/incompressible_pde_steady_state_training.png")
     plot_steady_state_profiles(ss_model.to("cpu"), physics)
 
     if tr_history is not None:
         plot_training_curves(tr_history, "PDE-PINC transient training",
-                              "incompressible_pde_transient_training.png")
+                              "plots/pde/incompressible_pde_transient_training.png")
 
     tr_model = tr_model.to("cpu")
     plot_open_loop_forward_simulation(tr_model, physics)
